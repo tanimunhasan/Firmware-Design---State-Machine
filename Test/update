@@ -1,0 +1,227 @@
+#include <msp430.h>
+
+#define BUFFER_SIZE    128 // Size of buffer to hold captured Modbus frames
+#define TIMEOUT_THRESHOLD  14583  // 1.82 ms timeout at 8MHz clock for 19200
+
+volatile char bufferA[BUFFER_SIZE];  // Size of the buffer to hold captured Modbus frames
+volatile char bufferB[BUFFER_SIZE]; // Second buffer for Modbus data
+volatile char* activeBuffer = bufferA;  // Active buffer pointer (initially bufferA)
+volatile char* sendBuffer = 0;       // Buffer to send to host
+
+volatile unsigned int bufferIndex = 0;  // Index to track buffer position in the active buffer
+volatile unsigned int modbusFrameComplete = 0; // Flag to indicate end of a frame
+volatile unsigned int bufferReadyToSend = 0; // Flag to indicate a buffer is ready to send
+void UARTRxTx();
+
+
+// Function to configure UART for Modbus communication (19200 baud, 8N1)
+void configureClocks(void)
+{
+    CSCTL0_H = CSKEY >> 8;             // Unlock CS registers
+    CSCTL1 = DCOFSEL_3 | DCORSEL;      // Set DCO to 8MHz
+    CSCTL2 = SELS__DCOCLK;             // Set SMCLK = DCO
+    CSCTL3 = DIVS__1;                  // Set SMCLK divider to 1
+    CSCTL0_H = 0;                      // Lock CS registers
+}
+
+
+// UART function to transmit single byte
+
+void uartTransmitChar(char c){
+    while(!(UCA1IFG & UCTXIFG)); // wait until the transmit buffer is empty
+    UCA1TXBUF = c;          // Send character
+}
+
+
+// UART function to transmit a string
+void uartTransmitString(const char * str){
+    while(*str){                // Loop through the string until buffer is empty
+        uartTransmitChar(*str); // Send each character
+        str++;          // Move to the next character
+    }
+}
+
+// UART function to transmit the contents of a buffer
+void uartTransmitBuffer(const char* buffer, unsigned int length) {
+    unsigned int i;
+    uartTransmitString("\r\nBuffer: ");
+    for (i = 0; i < length; i++) {
+        uartTransmitChar(buffer[i]);  // Send each byte in the buffer
+    }
+    uartTransmitString("\r\n");       // New line after buffer output
+}
+
+// UART function to transmit a single byte as a two-digit hex value
+void uartTransmitHexByte(unsigned char byte) {
+    const char hexChars[] = "0123456789ABCDEF";
+    uartTransmitChar(hexChars[(byte >> 4) & 0x0F]);  // Send high nibble
+    uartTransmitChar(hexChars[byte & 0x0F]);         // Send low nibble
+}
+
+// UART function to transmit the contents of a buffer as hex
+void uartTransmitBufferHex(const char* buffer, unsigned int length) {
+    unsigned int i;
+    uartTransmitString("\r\nBuffer (Hex): ");
+    for (i = 0; i < length; i++) {
+        uartTransmitHexByte(buffer[i]);  // Send each byte in hex
+        uartTransmitChar(' ');           // Add a space between bytes
+    }
+    uartTransmitString("\r\n");          // New line after buffer output
+}
+
+
+
+// Function to configure UART
+
+void configureUART()
+{
+    // Set UART configuration: 19200 baud rate, 8 data bits, no parity, 1 stop bit
+    UCA1CTL1 |= UCSWRST;                    // Put eUSCI in reset
+    UCA1CTL1 |= UCSSEL_2;                   // SMCLK as clock source
+
+    UCA1BRW = 26;                          // Baud rate 19200 for 8MHz clock
+
+    UCA1MCTLW = (0x54 << 8) | (0x00 << 4) | UCOS16;;                     // Modulation UCBRSx=0xD6, UCBRFx=0, oversampling
+
+
+    PM5CTL0 &= ~LOCKLPM5;       // Turn on I/O
+    UCA1CTL1 &= ~UCSWRST;                   // Initialize eUSCI
+    UCA1IE |= UCRXIE;                       // Enable USCI_A1 RX interrupt
+    UCA1IE |= UCTXIE;
+
+}
+
+
+void UARTRxTx(void){
+    /*
+    //P3.4(TXD) & P3.5(RXD)
+      P3SEL0 |= BIT4 | BIT5;     // Set P3.4 (TX) and P3.5 (RX) for UART mode (SEL0 = 1)
+      P3SEL1 &= ~(BIT4 | BIT5);  // Clear P3.3 and P3.4 in SEL1 (SEL1 = 0)
+      */
+
+    // Setup Ports
+    P3SEL1 &= ~BIT4;            // Clear P3SEL1 bit 4 (TXD)
+    P3SEL0 |= BIT4;             // Set P3SEL0 bit 4 (TXD)
+
+    P3SEL1 &= ~BIT5;            // Clear P3SEL1 bit 5 (RXD)
+    P3SEL0 |= BIT5;             // Set P3SEL0 bit 5 (RXD)
+
+}
+
+// Configure P3.0 as output to control LED
+void configureLED(void) {
+    P3DIR |= BIT0;    // Set P3.0 as output (LED)
+    P3OUT &= ~BIT0;   // Start with LED off
+}
+
+// Toggle the LED connected to P3.0
+void toggleLED(void) {
+    P3OUT ^= BIT0;    // Toggle P3.0 (LED)
+}
+
+// Example function to initialize RS485 transceiver in receive mode
+void configureRS485() {
+    P3DIR |= BIT7;                          // Set RS485 DE (Driver Enable) pin as output
+    P3OUT &= ~BIT7;                         // DE = 0 (receive mode)
+
+    P3DIR |= BIT3;                          // Set RS485 RE (Receive Enable) pin as output
+    P3OUT &= ~BIT3;                         // RE = 0 (receive mode)
+}
+
+void configureTimer(void){
+    TA0CCTL0 = CCIE;                        // Enable interrupt for Timer_A capture/compare
+    TA0CCR0 = TIMEOUT_THRESHOLD;            // Set compare value for timeout (1.82 ms)
+    TA0CTL =TASSEL_2 + MC_0;                // Use SMCLK (8MHz), stop the timer initially
+}
+
+void startTimer(void){
+    TA0R = 0;                               // Reset timer counter
+    TA0CTL |= MC_1;                         // Start timer in up mode
+}
+
+void stopTimer(void){
+
+    TA0CTL &= ~MC_1;                        // Stop the timer
+}
+
+// CRC16 calculation for Modbus (Polynomial: 0xA001)
+unsigned int calculateCRC16(const char* data, unsigned int length) {
+    unsigned int crc = 0xFFFF;        // Initialize CRC to 0xFFFF
+    unsigned int i, j;
+
+    for (i = 0; i < length; i++) {
+        crc ^= data[i];               // XOR byte into the current CRC value
+        for (j = 0; j < 8; j++) {
+            if (crc & 0x0001) {
+                crc >>= 1;
+                crc ^= 0xA001;        // Apply polynomial
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+
+
+// Example ISR for receiving Modbus data
+#pragma vector=USCI_A1_VECTOR
+__interrupt void USCI_A1_ISR(void) {
+    if (UCA1IFG & UCRXIFG) {                      // Check if data has been received
+        char receivedByte = UCA1RXBUF;            // Read received data
+
+        // Reset and start timer for timeout detection
+        stopTimer();
+        startTimer();
+
+
+        //Store the received byte in buffer if there's space
+        if(bufferIndex < BUFFER_SIZE){
+            activeBuffer[bufferIndex++] = receivedByte;
+        } else{
+                       // Reset buffer index to 1 (since byte is stored)
+        }
+
+    }
+}
+
+#pragma vector=TIMER_A0_VECTOR
+__interrupt void TIMER_A0_ISR(void){
+    // Modbus frame timeout occurred (end of frame detected)
+    stopTimer();
+
+    //Signal that a Modbus frame has been captured and is ready for processing
+    modbusFrameComplete = 1;
+
+    //Swap buffers: make the current buffer ready to send and switch to the next buffer
+    sendBuffer = activeBuffer;  // Assign activeBuffer to sendBuffer
+    bufferReadyToSend =1;       //Flag to send buffer
+    activeBuffer = (activeBuffer == bufferA)? bufferB:bufferA;
+    bufferIndex = 0;    // Reset the buffer index
+}
+
+void main(void) {
+    WDTCTL = WDTPW | WDTHOLD;               // Stop watchdog timer
+    configureClocks();
+    configureUART();                        // Initialize UART
+    UARTRxTx();
+    configureRS485();                       // Configure RS485 transceiver in receive mode
+    configureTimer();
+
+
+    __bis_SR_register(GIE);                 // Enable global interrupts
+    while (1) {
+        // Main loop: wait for modbus frame to be complete
+        if(modbusFrameComplete){
+            modbusFrameComplete= 0;     //Reset frame complete flag
+            //toggle LED
+            toggleLED();
+
+            uartTransmitBuffer(sendBuffer, bufferIndex); // // Send buffer content in hex
+            bufferIndex = 0; // Reset buffer index for the next frame
+            }
+        }
+        __bis_SR_register(LPM0_bits+GIE);   // Enter low power mode, wait for interrupts
+}
+
