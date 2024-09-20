@@ -19,7 +19,7 @@ typedef enum {
     STATE_PROCESS_FRAME,
     STATE_TRANSMIT_BUFFER
 } SystemState;
-
+// Used Dual Buffer: its possible to use ring buffer if need to implement
 volatile char bufferA[BUFFER_SIZE];  // Size of the buffer to hold captured Modbus frames
 volatile char bufferB[BUFFER_SIZE];  // Second buffer for Modbus data
 volatile char* activeBuffer = bufferA;  // Active buffer pointer (initially bufferA)
