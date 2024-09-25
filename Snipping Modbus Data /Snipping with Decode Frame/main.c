@@ -110,7 +110,7 @@ unsigned int calculateCRC16(const char* data, unsigned int length);
 int isValidFrame(const char* buffer, unsigned int length) {
     const unsigned int expectedFrameLength = bufferIndex;  // Adjust as per the actual frame length
     if (length != expectedFrameLength) return 0; // Frame is invalid due to incorrect length
-    if (buffer[0] != 0x01) return 0;  // Invalid if it doesn't start with the correct address
+    if (buffer[0] != 0x01  && buffer[0] != 0x02) return 0;  // Invalid if it doesn't start with the correct address
 
     // Validate CRC
     unsigned int receivedCRC = (buffer[length - 2] & 0xFF) | ((buffer[length - 1] & 0xFF) << 8);
